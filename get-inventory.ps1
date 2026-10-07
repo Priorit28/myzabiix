@@ -216,8 +216,8 @@ if ($null -ne $Latitude -and $null -ne $Longitude) {
 
 Add-Inv "inv.Hardware"      "Total RAM: $TotalRAMGB GB ($RAMSpeed MHz) | Free: $FreeRAMGB GB"
 Add-Inv "inv.HardwareFull"  "CPU: $CPUName ($CPUCores) | Mobo: $MoboModel"
-Add-Inv "inv.SoftwareA"     "GPU: $GPUName"
-Add-Inv "inv.SoftwareB"     $AllStorageString
+Add-Inv "inv.GPU"     "GPU: $GPUName"
+Add-Inv "inv.Storage"     $AllStorageString
 
 # ASCII without BOM (a BOM would corrupt the first key for zabbix_sender)
 Set-Content -Path $TempOutputFile -Value $Lines -Encoding ASCII
