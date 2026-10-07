@@ -1,5 +1,17 @@
 # Powershell script for Zabbix agents (Updated for Zabbix Agent 2)
-# Version 2.3 - Multi-Drive Storage & Type Detection
+# Version 2.5 - separate full OS string (inv.WinOSFull) and install date (inv.OSInstallDate)
+#
+# Sends every value with zabbix_sender. Each "inv.*" key needs a matching
+# "Zabbix trapper" item on the host (see key list at the bottom).
+
+# ------------------------------------------------------------------------- #
+# Settings
+# ------------------------------------------------------------------------- #
+
+# Location lookup changes machine-wide Windows location settings.
+# Leave $false unless you really want it.
+$UseGeolocation = $false
+
 
 # ------------------------------------------------------------------------- #
 # Variables & Path Detection
@@ -13,12 +25,23 @@ if (Test-Path "$Env:Programfiles\Zabbix Agent 2") {
     $ConfigFile = "$ZabbixInstallPath\zabbix_agentd.conf"
 }
 
-$Sender = "$ZabbixInstallPath\zabbix_sender.exe"
-$Senderarg1 = '-vv'
-$Senderarg2 = '-c'
-$Senderarg3 = $ConfigFile
-$Senderarg4 = '-i'
+$Sender         = "$ZabbixInstallPath\zabbix_sender.exe"
 $TempOutputFile = Join-Path $env:TEMP "wininvstatus.txt"
+
+if (-not (Test-Path $Sender)) {
+    Write-Output "ERROR: zabbix_sender.exe not found at $Sender"
+    exit 1
+}
+
+# Build one sender line: - key "value" (hostname "-" = Hostname from agent config)
+$Lines = New-Object System.Collections.Generic.List[string]
+function Add-Inv {
+    param([string]$Key, $Value)
+    $v = ([string]$Value) -replace '[\r\n]+', ' '
+    $v = $v -replace '\\', '\\'
+    $v = $v -replace '"', '\"'
+    $Lines.Add("- $Key ""$v""")
+}
 
 
 # ------------------------------------------------------------------------- #
@@ -31,6 +54,11 @@ $WinOS         = $OSInfo.Caption
 $Winarch       = $OSInfo.OSArchitecture
 $WinBuild      = $OSInfo.BuildNumber
 $OSInstallDate = $OSInfo.InstallDate.ToString("d")
+$LastBoot      = $OSInfo.LastBootUpTime.ToString("yyyy-MM-dd HH:mm")
+$CurVer        = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+$WinVersion    = $CurVer.DisplayVersion
+$WinBuildFull  = if ($CurVer.UBR -ne $null) { "$WinBuild.$($CurVer.UBR)" } else { $WinBuild }
+$WinOSFull     = "$WinOS $WinVersion (build $WinBuildFull) $Winarch | Installed: $OSInstallDate"
 
 # System & Computer
 $CSInfo        = Get-CimInstance Win32_ComputerSystem
@@ -44,7 +72,7 @@ $Loggedon      = $CSInfo.UserName
 # BIOS & Motherboard
 $BIOS          = Get-CimInstance Win32_BIOS
 $SerialNum     = $BIOS.SerialNumber
-$BIOSDate      = $BIOS.ReleaseDate.ToString("d")
+$BIOSDate      = if ($BIOS.ReleaseDate) { $BIOS.ReleaseDate.ToString("d") } else { "" }
 $Board         = Get-CimInstance Win32_BaseBoard
 $MoboModel     = "$($Board.Manufacturer) $($Board.Product)"
 
@@ -54,8 +82,8 @@ $CPUName       = $CPU.Name.Trim()
 $CPUCores      = "$($CPU.NumberOfCores) Cores / $($CPU.NumberOfLogicalProcessors) Threads"
 
 # Memory (RAM)
-$TotalRAMGB    = [math]::round($CSInfo.TotalPhysicalMemory / 1GB, 2)
-$FreeRAMGB     = [math]::round($OSInfo.FreePhysicalMemory / 1MB, 2)
+$TotalRAMGB    = [math]::Round($CSInfo.TotalPhysicalMemory / 1GB, 2)
+$FreeRAMGB     = [math]::Round($OSInfo.FreePhysicalMemory / 1MB, 2)
 $RAMSpeed      = (Get-CimInstance Win32_PhysicalMemory | Select-Object -ExpandProperty ConfiguredClockSpeed -First 1)
 
 # Graphics (GPU)
@@ -67,29 +95,28 @@ $GPUName       = $GPU.Name
 # Multi-Drive Storage & Media Type Detection
 # ------------------------------------------------------------------------- #
 
-# 1. Detect Media Types (SSD, HDD, NVMe, Hybrid)
+# 1. Detect media types (NVMe, SSD, HDD) - BusType is used for NVMe,
+#    anything the OS can't identify is reported as Unknown, not guessed as SSD.
 try {
-    $PhysDisks = Get-PhysicalDisk
-    $Types = @()
-    foreach ($disk in $PhysDisks) {
-        $media = $disk.MediaType
-        if ($media -eq "Unspecified" -or [string]::IsNullOrWhiteSpace($media)) {
-            $media = "SSD/NVMe"
-        }
-        if ($Types -notcontains $media) { $Types += $media }
-    }
-    $DiskType = $Types -join " + "
+    $Types = Get-PhysicalDisk | ForEach-Object {
+        $media = [string]$_.MediaType
+        $bus   = [string]$_.BusType
+        if     ($bus -eq 'NVMe')                { 'NVMe' }
+        elseif ($media -in 'SSD', 'HDD', 'SCM') { $media }
+        else                                    { 'Unknown' }
+    } | Sort-Object -Unique
+    $DiskType = if ($Types) { $Types -join " + " } else { "Unknown" }
 } catch {
     $DiskType = "Unknown"
 }
 
-# 2. Enumerate All Fixed Local Hard Disks (DriveType = 3)
-$LogicalDisks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
+# 2. Enumerate all fixed local disks (DriveType = 3)
+$LogicalDisks   = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
 $StorageSummary = @()
 
 foreach ($d in $LogicalDisks) {
-    $TotalGB = [math]::round($d.Size / 1GB, 2)
-    $FreeGB  = [math]::round($d.FreeSpace / 1GB, 2)
+    $TotalGB = [math]::Round($d.Size / 1GB, 2)
+    $FreeGB  = [math]::Round($d.FreeSpace / 1GB, 2)
     $StorageSummary += "$($d.DeviceID) $TotalGB GB (Free: $FreeGB GB)"
 }
 
@@ -100,96 +127,108 @@ $AllStorageString = $StorageSummary -join " | "
 # Network Configuration
 # ------------------------------------------------------------------------- #
 
-$NetAdapter    = Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true -and $_.DefaultIPGateway -ne $null } | Select-Object -First 1
+$NetAdapter    = Get-CimInstance Win32_NetworkAdapterConfiguration |
+                 Where-Object { $_.IPEnabled -eq $true -and $_.DefaultIPGateway -ne $null } |
+                 Select-Object -First 1
 $IPAddress     = $NetAdapter.IPAddress | Select-Object -First 1
 $IPGateway     = $NetAdapter.DefaultIPGateway | Select-Object -First 1
 $PrimDNSServer = $NetAdapter.DNSServerSearchOrder | Select-Object -First 1
+$MAC           = $NetAdapter.MACAddress
 
 
 # ------------------------------------------------------------------------- #
-# Location Information
+# Location Information (optional)
 # ------------------------------------------------------------------------- #
 
-try {
-    if (!(Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location")) {
-        New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" -Force | Out-Null
-    }
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location" -Name "Value" -Type String -Value "Allow" -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}" -Name "SensorPermissionState" -Type DWord -Value 1 -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration" -Name "Status" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+$Latitude  = $null
+$Longitude = $null
 
-    Add-Type -AssemblyName System.Device -ErrorAction SilentlyContinue
-    $GeoWatcher = New-Object System.Device.Location.GeoCoordinateWatcher
-    $GeoWatcher.Start()
+if ($UseGeolocation) {
+    try {
+        $LocKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+        if (!(Test-Path $LocKey)) { New-Item -Path $LocKey -Force | Out-Null }
+        Set-ItemProperty -Path $LocKey -Name "Value" -Type String -Value "Allow" -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Sensor\Overrides\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}" -Name "SensorPermissionState" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\lfsvc\Service\Configuration" -Name "Status" -Type DWord -Value 1 -ErrorAction SilentlyContinue
 
-    $timeout = 0
-    while (($GeoWatcher.Status -ne 'Ready') -and ($GeoWatcher.Permission -ne 'Denied') -and ($timeout -lt 20)) {
-        Start-Sleep -Milliseconds 100
-        $timeout++
-    }
+        Add-Type -AssemblyName System.Device -ErrorAction SilentlyContinue
+        $GeoWatcher = New-Object System.Device.Location.GeoCoordinateWatcher
+        $GeoWatcher.Start()
 
-    if ($GeoWatcher.Permission -eq 'Denied' -or $GeoWatcher.Status -ne 'Ready') {
-        $Latitude = '0'
-        $Longitude = '0'
-    } else {
-        $Latitude = $GeoWatcher.Position.Location.Latitude
-        $Longitude = $GeoWatcher.Position.Location.Longitude
+        $timeout = 0
+        while (($GeoWatcher.Status -ne 'Ready') -and ($GeoWatcher.Permission -ne 'Denied') -and ($timeout -lt 20)) {
+            Start-Sleep -Milliseconds 100
+            $timeout++
+        }
+
+        if ($GeoWatcher.Permission -ne 'Denied' -and $GeoWatcher.Status -eq 'Ready') {
+            $Latitude  = $GeoWatcher.Position.Location.Latitude
+            $Longitude = $GeoWatcher.Position.Location.Longitude
+        }
+    } catch {
+        # leave location empty
     }
-} catch {
-    $Latitude = '0'
-    $Longitude = '0'
 }
-
-$outputGeoLocation = "- inv.Geolocation ""$Latitude $Longitude"""
 
 
 # ------------------------------------------------------------------------- #
 # Format and Write to File
 # ------------------------------------------------------------------------- #
 
-$outputSystemName     = "- inv.Name ""$SystemName"""
-$outputType           = "- inv.Type ""$DiskType"""
-$outputWinOS          = "- inv.WinOS ""$WinOS"""
-$outputModelNum       = "- inv.ModelNum ""$ModelNum"""
-$outputManuf          = "- inv.Manuf ""$Manuf"""
-$outputWinDomain      = "- inv.WinDomain ""$WinDomain"""
-$outputOwner          = "- inv.Owner ""$Owner"""
-$outputLoggedon       = "- inv.Loggedon ""$Loggedon"""
-$outputOSInstallDate  = "- inv.OSInstallDate ""$OSInstallDate"""
-$outputBIOSDate       = "- inv.BIOSDate ""$BIOSDate"""
+Add-Inv "inv.Name"          $SystemName
+Add-Inv "inv.Type"          $DiskType
+Add-Inv "inv.WinOS"         $WinOS
+Add-Inv "inv.WinArch"       $Winarch
+Add-Inv "inv.WinBuild"      $WinBuild
+Add-Inv "inv.ModelNum"      $ModelNum
+Add-Inv "inv.Manuf"         $Manuf
+Add-Inv "inv.SerialNum"     $SerialNum
+Add-Inv "inv.WinDomain"     $WinDomain
+Add-Inv "inv.Owner"         $Owner
+Add-Inv "inv.Loggedon"      $Loggedon
+Add-Inv "inv.IPAddress"     $IPAddress
+Add-Inv "inv.IPGateway"     $IPGateway
+Add-Inv "inv.PrimDNSServer" $PrimDNSServer
+Add-Inv "inv.MAC"           $MAC
+Add-Inv "inv.BIOSDate"      $BIOSDate
+Add-Inv "inv.WinOSFull"     $WinOSFull
+Add-Inv "inv.OSInstallDate" $OSInstallDate
+Add-Inv "inv.LastBoot"      $LastBoot
 
-$outputRAM            = "- inv.Hardware ""Total RAM: $TotalRAMGB GB ($RAMSpeed MHz) | Free: $FreeRAMGB GB"""
-$outputHardwareFull   = "- inv.HardwareFull ""CPU: $CPUName ($CPUCores) | Mobo: $MoboModel"""
-$outputGPU            = "- inv.SoftwareA ""GPU: $GPUName"""
-$outputStorage        = "- inv.SoftwareB ""$AllStorageString"""
+if ($null -ne $Latitude -and $null -ne $Longitude) {
+    Add-Inv "inv.Latitude"  $Latitude
+    Add-Inv "inv.Longitude" $Longitude
+}
 
-Write-Output "- inv.WinArch $Winarch" | Out-File -Encoding "ASCII" -FilePath $TempOutputFile
-Add-Content $TempOutputFile $outputSystemName
-Add-Content $TempOutputFile $outputType
-Add-Content $TempOutputFile $outputWinOS
-Add-Content $TempOutputFile "- inv.WinBuild $WinBuild"
-Add-Content $TempOutputFile $outputModelNum
-Add-Content $TempOutputFile $outputManuf
-Add-Content $TempOutputFile "- inv.SerialNum $SerialNum"
-Add-Content $TempOutputFile $outputWinDomain
-Add-Content $TempOutputFile $outputOwner
-Add-Content $TempOutputFile $outputLoggedon
-Add-Content $TempOutputFile "- inv.IPAddress $IPAddress"
-Add-Content $TempOutputFile "- inv.IPGateway $IPGateway"
-Add-Content $TempOutputFile "- inv.PrimDNSServer $PrimDNSServer"
-Add-Content $TempOutputFile $outputBIOSDate
-Add-Content $TempOutputFile $outputOSInstallDate
-Add-Content $TempOutputFile $outputGeoLocation
+Add-Inv "inv.Hardware"      "Total RAM: $TotalRAMGB GB ($RAMSpeed MHz) | Free: $FreeRAMGB GB"
+Add-Inv "inv.HardwareFull"  "CPU: $CPUName ($CPUCores) | Mobo: $MoboModel"
+Add-Inv "inv.SoftwareA"     "GPU: $GPUName"
+Add-Inv "inv.SoftwareB"     $AllStorageString
 
-# Append System Information Items
-Add-Content $TempOutputFile $outputRAM
-Add-Content $TempOutputFile $outputHardwareFull
-Add-Content $TempOutputFile $outputGPU
-Add-Content $TempOutputFile $outputStorage
+# ASCII without BOM (a BOM would corrupt the first key for zabbix_sender)
+Set-Content -Path $TempOutputFile -Value $Lines -Encoding ASCII
 
 
 # ------------------------------------------------------------------------- #
 # Send Data to Zabbix
 # ------------------------------------------------------------------------- #
 
-& $Sender $Senderarg1 $Senderarg2 $Senderarg3 $Senderarg4 $TempOutputFile
+& $Sender -vv -c $ConfigFile -i $TempOutputFile 2>&1
+exit $LASTEXITCODE
+
+
+# ------------------------------------------------------------------------- #
+# Trapper items needed on the host (type: Zabbix trapper, information: Text)
+# ------------------------------------------------------------------------- #
+# inv.Name            -> Name                      inv.IPAddress      -> Host networks
+# inv.Type            -> Type                      inv.IPGateway      -> Host router
+# inv.WinOS           -> OS                        inv.PrimDNSServer  -> Software application C
+# inv.WinBuild        -> OS (short)                inv.MAC            -> MAC address A
+# inv.WinOSFull       -> OS (full details)         inv.BIOSDate       -> Software application D
+# inv.WinArch         -> HW architecture           inv.OSInstallDate  -> Date HW installed
+# inv.ModelNum        -> Model                     inv.LastBoot       -> Software application E
+# inv.Manuf           -> Vendor                    inv.Hardware       -> Hardware
+# inv.SerialNum       -> Serial number A           inv.HardwareFull   -> Hardware (full details)
+# inv.WinDomain       -> Location                  inv.SoftwareA      -> Software application A
+# inv.Owner           -> Contact                   inv.SoftwareB      -> Software application B
+# inv.Loggedon        -> Alias                     inv.Latitude/Longitude -> Location latitude/longitude
