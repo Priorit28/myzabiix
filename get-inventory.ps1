@@ -98,6 +98,24 @@ $TotalRAMGB    = [math]::Round($CSInfo.TotalPhysicalMemory / 1GB, 2)
 $FreeRAMGB     = [math]::Round($OSInfo.FreePhysicalMemory / 1MB, 2)
 $RAMSpeed      = (Get-CimInstance Win32_PhysicalMemory | Select-Object -ExpandProperty ConfiguredClockSpeed -First 1)
 
+# RAM slots: total on the board vs. modules installed
+try {
+    $RamArray   = Get-CimInstance Win32_PhysicalMemoryArray
+    $SlotsTotal = ($RamArray | Measure-Object -Property MemoryDevices -Sum).Sum
+    # MaxCapacityEx is in KB (MaxCapacity overflows on large boards)
+    $MaxKB      = ($RamArray | Measure-Object -Property MaxCapacityEx -Sum).Sum
+    $MaxRAMGB   = if ($MaxKB) { [math]::Round($MaxKB / 1MB, 0) } else { '?' }
+    $RamModules = @(Get-CimInstance Win32_PhysicalMemory)
+    $SlotsUsed  = $RamModules.Count
+    $ModuleDesc = ($RamModules | Group-Object Capacity | ForEach-Object {
+        "$($_.Count) x $([math]::Round([double]$_.Name / 1GB, 0)) GB"
+    }) -join ' + '
+    if (-not $SlotsTotal) { $SlotsTotal = '?' }
+    $RAMSlots = "Used $SlotsUsed of $SlotsTotal slots ($ModuleDesc) | Max supported: $MaxRAMGB GB"
+} catch {
+    $RAMSlots = 'Unknown'
+}
+
 # Graphics (GPU)
 $GPU           = Get-CimInstance Win32_VideoController | Select-Object -First 1
 $GPUName       = $GPU.Name
@@ -215,6 +233,7 @@ if ($null -ne $Latitude -and $null -ne $Longitude) {
 }
 
 Add-Inv "inv.Hardware"      "Total RAM: $TotalRAMGB GB ($RAMSpeed MHz) | Free: $FreeRAMGB GB"
+Add-Inv "inv.RAMSlots"      $RAMSlots
 Add-Inv "inv.HardwareFull"  "CPU: $CPUName ($CPUCores) | Mobo: $MoboModel"
 Add-Inv "inv.GPU"     "GPU: $GPUName"
 Add-Inv "inv.Storage"     $AllStorageString
@@ -243,8 +262,9 @@ exit $LASTEXITCODE
 # inv.ModelNum        -> Model                     inv.LastBoot       -> Software application E
 # inv.Manuf           -> Vendor                    inv.Hardware       -> Hardware
 # inv.SerialNum       -> Serial number A           inv.HardwareFull   -> Hardware (full details)
-# inv.WinDomain       -> Location                  inv.SoftwareA      -> Software application A
-# inv.Owner           -> Contact                   inv.SoftwareB      -> Software application B
+# inv.WinDomain       -> Location                  inv.GPU      -> Software application A
+# inv.Owner           -> Contact                   inv.Storage      -> Software application B
 # inv.Loggedon        -> Alias                     inv.Latitude/Longitude -> Location latitude/longitude
 # inv.UsersCount      -> (no inventory field; numeric item for graphs/triggers)
 # inv.UsersNames      -> POC 1 name
+# inv.RAMSlots        -> Software (full details)
