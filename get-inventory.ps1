@@ -111,7 +111,11 @@ try {
         "$($_.Count) x $([math]::Round([double]$_.Name / 1GB, 0)) GB"
     }) -join ' + '
     if (-not $SlotsTotal) { $SlotsTotal = '?' }
-    $RAMSlots = "Used $SlotsUsed of $SlotsTotal slots ($ModuleDesc) | Max supported: $MaxRAMGB GB"
+    # Windows does not report a per-DIMM maximum; this is total max / slots
+    $PerSlotMax = if (($MaxRAMGB -is [ValueType]) -and ($SlotsTotal -is [ValueType]) -and $SlotsTotal -gt 0) {
+        " (up to $([math]::Round($MaxRAMGB / $SlotsTotal, 0)) GB per slot)"
+    } else { '' }
+    $RAMSlots = "Used $SlotsUsed of $SlotsTotal slots ($ModuleDesc) | Max supported: $MaxRAMGB GB$PerSlotMax"
 } catch {
     $RAMSlots = 'Unknown'
 }
