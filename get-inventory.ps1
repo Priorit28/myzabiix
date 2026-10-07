@@ -69,6 +69,18 @@ $WinDomain     = $CSInfo.Domain
 $Owner         = $CSInfo.PrimaryOwnerName
 $Loggedon      = $CSInfo.UserName
 
+# Signed-in users (any session with an explorer.exe: console, RDP, disconnected)
+try {
+    $UserNames = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | ForEach-Object {
+        $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner
+        if ($o.User) { "$($o.Domain)\$($o.User)" }
+    } | Sort-Object -Unique
+} catch {
+    $UserNames = @()
+}
+$UserCount = @($UserNames).Count
+$UserList  = if ($UserCount -gt 0) { @($UserNames) -join ', ' } else { 'none' }
+
 # BIOS & Motherboard
 $BIOS          = Get-CimInstance Win32_BIOS
 $SerialNum     = $BIOS.SerialNumber
@@ -186,6 +198,8 @@ Add-Inv "inv.SerialNum"     $SerialNum
 Add-Inv "inv.WinDomain"     $WinDomain
 Add-Inv "inv.Owner"         $Owner
 Add-Inv "inv.Loggedon"      $Loggedon
+Add-Inv "inv.UsersCount"    $UserCount
+Add-Inv "inv.UsersNames"    $UserList
 Add-Inv "inv.IPAddress"     $IPAddress
 Add-Inv "inv.IPGateway"     $IPGateway
 Add-Inv "inv.PrimDNSServer" $PrimDNSServer
@@ -232,3 +246,5 @@ exit $LASTEXITCODE
 # inv.WinDomain       -> Location                  inv.SoftwareA      -> Software application A
 # inv.Owner           -> Contact                   inv.SoftwareB      -> Software application B
 # inv.Loggedon        -> Alias                     inv.Latitude/Longitude -> Location latitude/longitude
+# inv.UsersCount      -> (no inventory field; numeric item for graphs/triggers)
+# inv.UsersNames      -> POC 1 name
